@@ -1,36 +1,34 @@
 import scrapy
 import urllib.parse
-import json
+from ..loaders import AutoyoulaLoader
+from .autoyoula_cfg import XPATH
 from base64 import b64decode
+import json
+
 
 class AutoyoulaSpider(scrapy.Spider):
     name = 'autoyoula'
     allowed_domains = ['auto.youla.ru']
     start_urls = ['https://auto.youla.ru/']
-    _css_selectors = {
-        'brands' :  "div.TransportMainFilters_brandsList__2tIkv "
-                    ".ColumnItemList_item__32nYI "
-                    "a.blackLink",
 
-        "next" :    "div.Paginator_block__2XAPy "
-                    "a.Paginator_button__u1e7D",
-
-        "article" : "article.SerpSnippet_snippet__3O1t2 "
-                    ".SerpSnippet_titleWrapper__38bZM "
-                    "a.blackLink",
-
-        "article.title": "div.AdvertCard_advertTitle__1S1Ak::text",
-        "article.chars.titles": "div.AdvertSpecs_label__2JHnS::text",
-        "article.chars.values": "div.AdvertSpecs_data__xK2Qx ::text",
-    }
-
-    def __init__(self, *args, **kwargs):
-        self.storage = kwargs['storage'] if 'storage' in kwargs else None
-        
     def _get_follow(self, response, selector, cb, **kwargs):
-        for link in response.css(self._css_selectors[selector]):
-            url = link.attrib.get("href")
-            yield response.follow(url, callback=cb, cb_kwargs=kwargs)
+        for link in response.xpath(XPATH[selector]):
+            yield response.follow(link, callback=cb, cb_kwargs=kwargs)
+
+    def car_parse(self, response, *args, **kwargs):
+        loader = AutoyoulaLoader(response=response)
+        loader.add_value("url", response.url)
+        loader.add_xpath("characteristics", xpath=XPATH["article.chars"])
+        loader.add_xpath("title", xpath=XPATH["article.title"])
+        self._load_value_from_json(response, loader)
+        yield loader.load_item()
+     
+    def brand_parse(self, response, *args, **kwargs):
+        yield from self._get_follow(response, "next", self.brand_parse)
+        yield from self._get_follow(response, "article", self.car_parse)
+
+    def parse(self, response, *args, **kwargs):
+        yield from self._get_follow(response, "brands", self.brand_parse)
 
     @staticmethod
     def _to_dict(settings):
@@ -45,37 +43,15 @@ class AutoyoulaSpider(scrapy.Spider):
                 settings[idx] = __class__._to_dict(itm)
         return settings
 
-    def car_parse(self, response, *args, **kwargs):
+    def _load_value_from_json(self, response, loader):
+        json_str_settings = response.xpath(XPATH["article.data"]["xpath"])\
+                                .re_first(XPATH["article.data"]["regex"])
 
-        def get_car_data():
-            char_titles = response.css(self._css_selectors["article.chars.titles"]).extract()
-            chars = response.css(self._css_selectors["article.chars.values"]).extract()
-            json_str_settings = response.css("script::text").re_first('^window\.transitState\s*=\s*decodeURIComponent\(\\"(...+)\\"\)\;')
-            list_settings = json.loads(urllib.parse.unquote(json_str_settings))
-            settings = __class__._to_dict(list_settings)
-            # TODO: Оптимизнуть и сделать строку путь в настройках
-            phones = settings["~#iM"]["advertCard"]["^0"]["contacts"]["^0"]["phones"]["^1"]
-            images = settings["~#iM"]["advertCard"]["^0"]["media"]["^1"]
-            return {
-                "_id": settings["~#iM"]["advertCard"]["^0"]["id"],
-                "title" : response.css(self._css_selectors["article.title"]).extract_first(),
-                "characteristics" : dict(zip(char_titles, chars)),
-                "phones" : [ bytes.decode(b64decode(b64decode(itm["^0"]["phone"]))) for itm in phones ],
-                "images" : [ itm["^0"]["big"] for itm in images ],
-                "description" : settings["~#iM"]["advertCard"]["^0"]["description"],
-                "user_url" : f'https://youla.ru/user/{settings["~#iM"]["advertCard"]["^0"]["youlaProfile"]["^0"]["youlaId"]}',
-            }
+        list_settings = json.loads(urllib.parse.unquote(json_str_settings))
+        settings = __class__._to_dict(list_settings)
+        phones = settings["~#iM"]["advertCard"]["^0"]["contacts"]["^0"]["phones"]["^1"]
+        images = settings["~#iM"]["advertCard"]["^0"]["media"]["^1"]
+        loader.add_value("images", [ itm["^0"]["big"] for itm in images ])
+        loader.add_value("phones", [ bytes.decode(b64decode(b64decode(itm["^0"]["phone"]))) for itm in phones ])
+        loader.add_value("description", settings["~#iM"]["advertCard"]["^0"]["description"])
 
-        # Выделим требуху, если получиться
-        try:
-            self.storage.save(get_car_data())
-        except:
-            # TODO: Криво структуру смотрим
-            print("Проверить структуру для парсинга")
-     
-    def brand_parse(self, response, *args, **kwargs):
-        yield from self._get_follow(response, "next", self.brand_parse)
-        yield from self._get_follow(response, "article", self.car_parse)
-
-    def parse(self, response, *args, **kwargs):
-        yield from self._get_follow(response, "brands", self.brand_parse)
